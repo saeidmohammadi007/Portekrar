@@ -19,7 +19,7 @@ TICKERS = [
     "ADA-USD", "DOGE-USD", "LINK-USD", "AVAX-USD", "DOT-USD"
 ]
 
-START_DATE = "2015-01-01"
+START_DATE = None
 END_DATE = None
 
 PATTERN_LENGTH = 85
@@ -40,14 +40,25 @@ MIN_GAP = PATTERN_LENGTH
 # ============================================================
 def get_data(ticker):
     print(f"دریافت {ticker} ...")
-    df = yf.download(
-        ticker,
-        start=START_DATE,
-        end=END_DATE,
-        interval="1d",
-        auto_adjust=True,
-        progress=False
-    )
+
+    if START_DATE is None:
+        df = yf.download(
+            ticker,
+            period="max",
+            interval="1d",
+            auto_adjust=True,
+            progress=False
+        )
+    else:
+        df = yf.download(
+            ticker,
+            start=START_DATE,
+            end=END_DATE,
+            interval="1d",
+            auto_adjust=True,
+            progress=False
+        )
+
     if df.empty:
         print(f"❌ داده‌ای برای {ticker} پیدا نشد")
         return None
