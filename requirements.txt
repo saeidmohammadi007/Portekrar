@@ -1,0 +1,4 @@
+yfinance
+dtw-python
+pandas
+numpy
