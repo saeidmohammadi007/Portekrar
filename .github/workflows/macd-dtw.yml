@@ -1,0 +1,36 @@
+name: MACD DTW Pattern Finder
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-macd-dtw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run MACD DTW
+        run: python macd_dtw.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macd-dtw-output
+          path: |
+            macd_dtw_result.txt
+            macd_dtw_summary.csv
+          retention-days: 30
