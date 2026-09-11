@@ -33,7 +33,7 @@ SIGNAL = 9
 MAX_DISTANCE = 0.80
 SAKOE_CHIBA_RATIO = 0.5
 MIN_OCCURRENCES = 5
-TOP_PATTERNS = 20
+TOP_PATTERNS = 10          # ← فقط ۱۰ الگوی پرتکرار
 MIN_GAP = PATTERN_LENGTH
 
 
@@ -247,21 +247,24 @@ for i in range(len(all_patterns)):
 
 groups.sort(key=lambda x: x["count"], reverse=True)
 
+# فقط ۱۰ گروه برتر
+top_groups = groups[:TOP_PATTERNS]
+
 
 # ============================================================
 # خروجی متنی
 # ============================================================
 lines = []
 lines.append("#" * 56)
-lines.append(" پرتکرارترین الگوهای MACD")
+lines.append(" پرتکرارترین الگوهای MACD (۱۰ الگوی برتر)")
 lines.append("#" * 56)
 
-if len(groups) == 0:
+if len(top_groups) == 0:
     lines.append("")
     lines.append("هیچ الگوی پرتکراری با تنظیمات فعلی پیدا نشد.")
     lines.append("برای پیدا کردن نمونه‌های بیشتر، MAX_DISTANCE را افزایش بده.")
 else:
-    for rank, group in enumerate(groups[:TOP_PATTERNS], 1):
+    for rank, group in enumerate(top_groups, 1):
         reference = all_patterns[group["reference"]]
         lines.append("")
         lines.append("=" * 56)
@@ -292,7 +295,7 @@ else:
 
 
 summary = []
-for rank, group in enumerate(groups[:TOP_PATTERNS], 1):
+for rank, group in enumerate(top_groups, 1):
     reference = all_patterns[group["reference"]]
     summary.append({
         "Rank": rank,
@@ -306,7 +309,7 @@ summary_df = pd.DataFrame(summary)
 
 lines.append("")
 lines.append("=" * 56)
-lines.append("خلاصه")
+lines.append("خلاصه (۱۰ الگوی برتر)")
 lines.append("=" * 56)
 lines.append(summary_df.to_string(index=False) if not summary_df.empty else "خالی")
 
@@ -334,6 +337,11 @@ if TOKEN and CHAT_ID:
     print("📤 ارسال به تلگرام ...")
     send_to_telegram(output_text, TOKEN, CHAT_ID)
     if not summary_df.empty:
-        send_document("macd_dtw_summary.csv", TOKEN, CHAT_ID, "📊 خلاصه الگوهای MACD")
+        send_document(
+            "macd_dtw_summary.csv",
+            TOKEN,
+            CHAT_ID,
+            "📊 خلاصه ۱۰ الگوی پرتکرار MACD"
+        )
 else:
     print("⚠️ TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده — ارسال انجام نشد.")
