@@ -24,17 +24,20 @@ TICKERS = [
 START_DATE = None
 END_DATE = None
 
-PATTERN_LENGTH = 85
+PATTERN_LENGTH = 60
 
 FAST = 12
 SLOW = 26
 SIGNAL = 9
 
-MAX_DISTANCE = 0.80
+MAX_DISTANCE = 2.0
 SAKOE_CHIBA_RATIO = 0.5
-MIN_OCCURRENCES = 5
-TOP_PATTERNS = 10          # ← فقط ۱۰ الگوی پرتکرار
+MIN_OCCURRENCES = 3
+TOP_PATTERNS = 10
 MIN_GAP = PATTERN_LENGTH
+
+# پیش‌فیلتر L2 — اگر L2 از این بیشتر بود، DTW محاسبه نمی‌شود
+L2_PREFILTER = 4.0
 
 
 # ============================================================
@@ -80,6 +83,17 @@ def normalize(x):
     if std < 1e-10:
         return x - mean
     return (x - mean) / std
+
+
+def l2_norm_dist(a, b):
+    """فاصله‌ی ارزان L2 روی دنباله‌های z-normalize شده."""
+    a = normalize(a)
+    b = normalize(b)
+    if len(a) != len(b):
+        # اگر طول‌ها متفاوت بود (نباید بشه چون PATTERN_LENGTH ثابته)
+        n = min(len(a), len(b))
+        a, b = a[:n], b[:n]
+    return float(np.linalg.norm(a - b) / len(a))
 
 
 def dtw_distance(a, b):
@@ -169,7 +183,10 @@ for ticker in TICKERS:
     macd_values = macd_df["MACD"].values
     dates = macd_df.index
 
-    for end_idx in range(PATTERN_LENGTH, len(macd_values) + 1):
+    # گام غیریک برای کاهش تعداد الگوها (بدون از دست دادن اطلاعات مفید)
+    step = max(1, PATTERN_LENGTH // 4)
+
+    for end_idx in range(PATTERN_LENGTH, len(macd_values) + 1, step):
         start_idx = end_idx - PATTERN_LENGTH
         pattern = macd_values[start_idx:end_idx]
         all_patterns.append({
@@ -188,6 +205,41 @@ print("================================================")
 print(len(all_patterns))
 print(f"طول هر الگو: {PATTERN_LENGTH} کندل روزانه")
 print(f"DTW با Sakoe-Chiba Band = {SAKOE_CHIBA_RATIO}")
+
+if len(all_patterns) < MIN_OCCURRENCES:
+    print(f"❌ فقط {len(all_patterns)} الگو ساخته شد؛ حداقل {MIN_OCCURRENCES} لازم است.")
+    raise SystemExit
+
+
+# ============================================================
+# (اختیاری) تشخیص توزیع فاصله برای اطمینان از منطقی بودن MAX_DISTANCE
+# ============================================================
+print()
+print("نمونه‌گیری از توزیع فاصله‌های DTW ...")
+rng = np.random.default_rng(42)
+sample_dists = []
+n = len(all_patterns)
+tries = 0
+while len(sample_dists) < 1000 and tries < 20000:
+    tries += 1
+    i, j = rng.integers(0, n, 2)
+    if i == j:
+        continue
+    a, b = all_patterns[i], all_patterns[j]
+    if patterns_overlap(a, b):
+        continue
+    # پیش‌فیلتر L2
+    if l2_norm_dist(a["pattern"], b["pattern"]) > L2_PREFILTER:
+        continue
+    sample_dists.append(dtw_distance(a["pattern"], b["pattern"]))
+
+if sample_dists:
+    sd = np.array(sample_dists)
+    print(f"  تعداد نمونه: {len(sd)}")
+    print(f"  min={sd.min():.3f}  p05={np.percentile(sd,5):.3f}  "
+          f"p25={np.percentile(sd,25):.3f}  p50={np.percentile(sd,50):.3f}  "
+          f"p75={np.percentile(sd,75):.3f}  max={sd.max():.3f}")
+    print(f"  ➜ MAX_DISTANCE فعلی: {MAX_DISTANCE}")
 
 
 # ============================================================
@@ -213,6 +265,10 @@ for i in range(len(all_patterns)):
         candidate = all_patterns[j]
 
         if patterns_overlap(reference, candidate):
+            continue
+
+        # پیش‌فیلتر ارزان L2 قبل از DTW
+        if l2_norm_dist(reference["pattern"], candidate["pattern"]) > L2_PREFILTER:
             continue
 
         distance = dtw_distance(reference["pattern"], candidate["pattern"])
@@ -242,10 +298,23 @@ for i in range(len(all_patterns)):
             "count": occurrences
         })
         used_patterns.add(i)
-        for j, _ in selected:
-            used_patterns.add(j)
+        # توجه: matchها را در used نمی‌گذاریم تا گروه‌های بعدی هم شانس داشته باشند
+
+    if (i + 1) % 200 == 0:
+        print(f"  پیشرفت: {i+1}/{len(all_patterns)} — گروه‌های یافت‌شده: {len(groups)}")
 
 groups.sort(key=lambda x: x["count"], reverse=True)
+
+# --- نمایش کیفیت گروه‌ها ---
+print()
+print("--- کیفیت گروه‌های یافت‌شده (برترها) ---")
+for rank, g in enumerate(groups[:20], 1):
+    dists = [d for _, d in g["matches"]]
+    if dists:
+        print(f"  رتبه {rank}: تکرار={g['count']}  "
+              f"میانگین DTW={np.mean(dists):.3f}  max={max(dists):.3f}")
+    else:
+        print(f"  رتبه {rank}: تکرار={g['count']}")
 
 # فقط ۱۰ گروه برتر
 top_groups = groups[:TOP_PATTERNS]
@@ -297,12 +366,15 @@ else:
 summary = []
 for rank, group in enumerate(top_groups, 1):
     reference = all_patterns[group["reference"]]
+    dists = [d for _, d in group["matches"]]
     summary.append({
         "Rank": rank,
         "Symbol": reference["ticker"],
         "Pattern Start": reference["start_date"].strftime("%Y-%m-%d"),
         "Pattern End": reference["end_date"].strftime("%Y-%m-%d"),
-        "Occurrences": group["count"]
+        "Occurrences": group["count"],
+        "Avg DTW": round(float(np.mean(dists)), 4) if dists else 0.0,
+        "Max DTW": round(float(max(dists)), 4) if dists else 0.0,
     })
 
 summary_df = pd.DataFrame(summary)
@@ -314,6 +386,7 @@ lines.append("=" * 56)
 lines.append(summary_df.to_string(index=False) if not summary_df.empty else "خالی")
 
 output_text = "\n".join(lines)
+print()
 print(output_text)
 
 with open("macd_dtw_result.txt", "w", encoding="utf-8") as f:
