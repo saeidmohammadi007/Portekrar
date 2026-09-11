@@ -1,12 +1,12 @@
 # ============================================================
 # پیدا کردن الگوهای پرتکرار MACD با DTW + ارسال به تلگرام
-# اجرا روی GitHub Actions
 # ============================================================
 
 import warnings
 warnings.filterwarnings("ignore")
 
 import os
+import time
 import html
 import numpy as np
 import pandas as pd
@@ -21,11 +21,7 @@ TICKERS = [
     "BTC-USD", "BNB-USD", "XTZ-USD", "AVAX-USD", "DOGE-USD"
 ]
 
-START_DATE = None
-END_DATE = None
-
 PATTERN_LENGTH = 60
-
 FAST = 12
 SLOW = 26
 SIGNAL = 9
@@ -35,35 +31,81 @@ SAKOE_CHIBA_RATIO = 0.5
 MIN_OCCURRENCES = 3
 TOP_PATTERNS = 10
 MIN_GAP = PATTERN_LENGTH
-
-# پیش‌فیلتر L2 — اگر L2 از این بیشتر بود، DTW محاسبه نمی‌شود
 L2_PREFILTER = 4.0
 
 
 # ============================================================
-# توابع کمکی
+# دریافت داده (مقاوم با retry + fallback)
 # ============================================================
-def get_data(ticker):
-    print(f"دریافت {ticker} ...")
-    df = yf.download(
-        ticker,
-        start=START_DATE,
-        end=END_DATE,
-        interval="1d",
-        auto_adjust=True,
-        progress=False
-    )
-    if df.empty:
-        print(f"❌ داده‌ای برای {ticker} پیدا نشد")
+def _clean_df(df):
+    if df is None or df.empty:
         return None
-
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
+    if "Close" not in df.columns:
+        return None
     df = df[["Close"]].dropna()
     return df
 
 
+def get_data(ticker, max_retries=3):
+    print(f"دریافت {ticker} ...")
+    last_err = None
+
+    for attempt in range(1, max_retries + 1):
+        # تلاش ۱: yf.download با period
+        try:
+            df = yf.download(
+                ticker,
+                period="5y",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                timeout=30,
+            )
+            df = _clean_df(df)
+            if df is not None and len(df) >= PATTERN_LENGTH:
+                print(f"  ✅ {ticker}: {len(df)} رکورد.")
+                return df
+        except Exception as e:
+            last_err = e
+
+        # تلاش ۲: fallback با Ticker.history
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(period="5y", interval="1d", auto_adjust=True)
+            df = _clean_df(df)
+            if df is not None and len(df) >= PATTERN_LENGTH:
+                print(f"  ✅ {ticker} (history): {len(df)} رکورد.")
+                return df
+        except Exception as e:
+            last_err = e
+
+        # تلاش ۳: period کوتاه‌تر
+        try:
+            df = yf.download(
+                ticker, period="2y", interval="1d",
+                auto_adjust=True, progress=False,
+                threads=False, timeout=30,
+            )
+            df = _clean_df(df)
+            if df is not None and len(df) >= PATTERN_LENGTH:
+                print(f"  ✅ {ticker} (2y): {len(df)} رکورد.")
+                return df
+        except Exception as e:
+            last_err = e
+
+        print(f"  ⚠️ تلاش {attempt} ناموفق برای {ticker}")
+        time.sleep(2 * attempt)
+
+    print(f"❌ {ticker}: داده پیدا نشد. آخرین خطا: {last_err}")
+    return None
+
+
+# ============================================================
+# محاسبات
+# ============================================================
 def calculate_macd(df):
     close = df["Close"].astype(float)
     ema_fast = close.ewm(span=FAST, adjust=False).mean()
@@ -86,11 +128,9 @@ def normalize(x):
 
 
 def l2_norm_dist(a, b):
-    """فاصله‌ی ارزان L2 روی دنباله‌های z-normalize شده."""
     a = normalize(a)
     b = normalize(b)
     if len(a) != len(b):
-        # اگر طول‌ها متفاوت بود (نباید بشه چون PATTERN_LENGTH ثابته)
         n = min(len(a), len(b))
         a, b = a[:n], b[:n]
     return float(np.linalg.norm(a - b) / len(a))
@@ -119,7 +159,7 @@ def patterns_overlap(a, b):
 
 
 # ============================================================
-# توابع تلگرام
+# تلگرام
 # ============================================================
 def send_to_telegram(text, token, chat_id):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -136,7 +176,7 @@ def send_to_telegram(text, token, chat_id):
         try:
             r = requests.post(url, data=payload, timeout=30)
             if r.status_code != 200:
-                print(f"⚠️ تلگرام خطا داد (بخش {i}): {r.status_code} - {r.text}")
+                print(f"⚠️ تلگرام خطا (بخش {i}): {r.status_code} - {r.text}")
             else:
                 print(f"📨 بخش {i}/{len(chunks)} ارسال شد.")
         except Exception as e:
@@ -177,13 +217,12 @@ for ticker in TICKERS:
     macd_df = calculate_macd(df)
 
     if len(macd_df) < PATTERN_LENGTH:
-        print(f"⚠️ {ticker}: داده کافی ندارد.")
+        print(f"⚠️ {ticker}: داده کافی ندارد ({len(macd_df)} < {PATTERN_LENGTH}).")
         continue
 
     macd_values = macd_df["MACD"].values
     dates = macd_df.index
 
-    # گام غیریک برای کاهش تعداد الگوها (بدون از دست دادن اطلاعات مفید)
     step = max(1, PATTERN_LENGTH // 4)
 
     for end_idx in range(PATTERN_LENGTH, len(macd_values) + 1, step):
@@ -207,12 +246,23 @@ print(f"طول هر الگو: {PATTERN_LENGTH} کندل روزانه")
 print(f"DTW با Sakoe-Chiba Band = {SAKOE_CHIBA_RATIO}")
 
 if len(all_patterns) < MIN_OCCURRENCES:
-    print(f"❌ فقط {len(all_patterns)} الگو ساخته شد؛ حداقل {MIN_OCCURRENCES} لازم است.")
+    msg = (
+        f"❌ فقط {len(all_patterns)} الگو ساخته شد؛ "
+        f"حداقل {MIN_OCCURRENCES} لازم است.\n"
+        "یعنی دریافت داده از yfinance ناموفق بود.\n"
+        "راه‌حل: workflow را چک کن یا از Stooq استفاده کن."
+    )
+    print(msg)
+    # ارسال پیام خطا به تلگرام
+    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+    if TOKEN and CHAT_ID:
+        send_to_telegram(msg, TOKEN, CHAT_ID)
     raise SystemExit
 
 
 # ============================================================
-# (اختیاری) تشخیص توزیع فاصله برای اطمینان از منطقی بودن MAX_DISTANCE
+# توزیع فاصله‌ها
 # ============================================================
 print()
 print("نمونه‌گیری از توزیع فاصله‌های DTW ...")
@@ -228,7 +278,6 @@ while len(sample_dists) < 1000 and tries < 20000:
     a, b = all_patterns[i], all_patterns[j]
     if patterns_overlap(a, b):
         continue
-    # پیش‌فیلتر L2
     if l2_norm_dist(a["pattern"], b["pattern"]) > L2_PREFILTER:
         continue
     sample_dists.append(dtw_distance(a["pattern"], b["pattern"]))
@@ -236,9 +285,7 @@ while len(sample_dists) < 1000 and tries < 20000:
 if sample_dists:
     sd = np.array(sample_dists)
     print(f"  تعداد نمونه: {len(sd)}")
-    print(f"  min={sd.min():.3f}  p05={np.percentile(sd,5):.3f}  "
-          f"p25={np.percentile(sd,25):.3f}  p50={np.percentile(sd,50):.3f}  "
-          f"p75={np.percentile(sd,75):.3f}  max={sd.max():.3f}")
+    print(f"  min={sd.min():.3f}  p50={np.percentile(sd,50):.3f}  max={sd.max():.3f}")
     print(f"  ➜ MAX_DISTANCE فعلی: {MAX_DISTANCE}")
 
 
@@ -263,16 +310,13 @@ for i in range(len(all_patterns)):
             continue
 
         candidate = all_patterns[j]
-
         if patterns_overlap(reference, candidate):
             continue
 
-        # پیش‌فیلتر ارزان L2 قبل از DTW
         if l2_norm_dist(reference["pattern"], candidate["pattern"]) > L2_PREFILTER:
             continue
 
         distance = dtw_distance(reference["pattern"], candidate["pattern"])
-
         if distance <= MAX_DISTANCE:
             candidates.append((j, distance))
 
@@ -298,25 +342,21 @@ for i in range(len(all_patterns)):
             "count": occurrences
         })
         used_patterns.add(i)
-        # توجه: matchها را در used نمی‌گذاریم تا گروه‌های بعدی هم شانس داشته باشند
 
     if (i + 1) % 200 == 0:
-        print(f"  پیشرفت: {i+1}/{len(all_patterns)} — گروه‌های یافت‌شده: {len(groups)}")
+        print(f"  پیشرفت: {i+1}/{len(all_patterns)} — گروه: {len(groups)}")
 
 groups.sort(key=lambda x: x["count"], reverse=True)
 
-# --- نمایش کیفیت گروه‌ها ---
 print()
-print("--- کیفیت گروه‌های یافت‌شده (برترها) ---")
+print("--- کیفیت گروه‌های یافت‌شده ---")
 for rank, g in enumerate(groups[:20], 1):
     dists = [d for _, d in g["matches"]]
     if dists:
-        print(f"  رتبه {rank}: تکرار={g['count']}  "
-              f"میانگین DTW={np.mean(dists):.3f}  max={max(dists):.3f}")
+        print(f"  رتبه {rank}: تکرار={g['count']}  میانگین DTW={np.mean(dists):.3f}")
     else:
         print(f"  رتبه {rank}: تکرار={g['count']}")
 
-# فقط ۱۰ گروه برتر
 top_groups = groups[:TOP_PATTERNS]
 
 
@@ -362,7 +402,6 @@ else:
                 f"{distance:<12.4f}"
             )
 
-
 summary = []
 for rank, group in enumerate(top_groups, 1):
     reference = all_patterns[group["reference"]]
@@ -396,7 +435,7 @@ if not summary_df.empty:
     summary_df.to_csv("macd_dtw_summary.csv", index=False)
 
 print()
-print("✅ خروجی در macd_dtw_result.txt و macd_dtw_summary.csv ذخیره شد.")
+print("✅ خروجی ذخیره شد.")
 
 
 # ============================================================
@@ -417,4 +456,4 @@ if TOKEN and CHAT_ID:
             "📊 خلاصه ۱۰ الگوی پرتکرار MACD"
         )
 else:
-    print("⚠️ TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده — ارسال انجام نشد.")
+    print("⚠️ TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده.")
