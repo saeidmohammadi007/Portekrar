@@ -140,12 +140,22 @@ def dtw_distance(a, b):
     a = normalize(a)
     b = normalize(b)
     window_size = max(1, int(SAKOE_CHIBA_RATIO * max(len(a), len(b))))
-    result = dtw(
-        a, b,
-        keep_internals=False,
-        window_type="sakoechiba",
-        window_size=window_size,
-    )
+    try:
+        # نسخه‌های جدید dtw-python
+        result = dtw(
+            a, b,
+            keep_internals=False,
+            window_type="sakoechiba",
+            window_args={"window_size": window_size},
+        )
+    except TypeError:
+        # fallback برای نسخه‌های قدیمی‌تر
+        result = dtw(
+            a, b,
+            keep_internals=False,
+            window_type="sakoechiba",
+            window_size=window_size,
+        )
     return result.distance / len(a)
 
 
@@ -249,11 +259,9 @@ if len(all_patterns) < MIN_OCCURRENCES:
     msg = (
         f"❌ فقط {len(all_patterns)} الگو ساخته شد؛ "
         f"حداقل {MIN_OCCURRENCES} لازم است.\n"
-        "یعنی دریافت داده از yfinance ناموفق بود.\n"
-        "راه‌حل: workflow را چک کن یا از Stooq استفاده کن."
+        "یعنی دریافت داده از yfinance ناموفق بود."
     )
     print(msg)
-    # ارسال پیام خطا به تلگرام
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
     if TOKEN and CHAT_ID:
