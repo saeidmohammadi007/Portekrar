@@ -1,25 +1,27 @@
 # ============================================================
-# پیدا کردن الگوهای پرتکرار MACD با DTW
+# پیدا کردن الگوهای پرتکرار MACD با DTW + ارسال به تلگرام
 # اجرا روی GitHub Actions
 # ============================================================
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
+import html
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
 from dtw import dtw
 
 # ============================================================
 # تنظیمات
 # ============================================================
 TICKERS = [
-    "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "SOL-USD",
-    "ADA-USD", "DOGE-USD", "LINK-USD", "AVAX-USD", "DOT-USD"
+    "BTC-USD", "BNB-USD", "XTZ-USD", "AVAX-USD", "DOGE-USD"
 ]
 
-START_DATE = None
+START_DATE = "2015-01-01"
 END_DATE = None
 
 PATTERN_LENGTH = 85
@@ -36,29 +38,18 @@ MIN_GAP = PATTERN_LENGTH
 
 
 # ============================================================
-# توابع
+# توابع کمکی
 # ============================================================
 def get_data(ticker):
     print(f"دریافت {ticker} ...")
-
-    if START_DATE is None:
-        df = yf.download(
-            ticker,
-            period="max",
-            interval="1d",
-            auto_adjust=True,
-            progress=False
-        )
-    else:
-        df = yf.download(
-            ticker,
-            start=START_DATE,
-            end=END_DATE,
-            interval="1d",
-            auto_adjust=True,
-            progress=False
-        )
-
+    df = yf.download(
+        ticker,
+        start=START_DATE,
+        end=END_DATE,
+        interval="1d",
+        auto_adjust=True,
+        progress=False
+    )
     if df.empty:
         print(f"❌ داده‌ای برای {ticker} پیدا نشد")
         return None
@@ -111,6 +102,52 @@ def patterns_overlap(a, b):
             or b["end_idx"] + MIN_GAP <= a["start_idx"]):
         return False
     return True
+
+
+# ============================================================
+# توابع تلگرام
+# ============================================================
+def send_to_telegram(text, token, chat_id):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    MAX_LEN = 4000
+    safe_text = html.escape(text)
+    chunks = [safe_text[i:i + MAX_LEN] for i in range(0, len(safe_text), MAX_LEN)]
+    for i, chunk in enumerate(chunks, 1):
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            r = requests.post(url, data=payload, timeout=30)
+            if r.status_code != 200:
+                print(f"⚠️ تلگرام خطا داد (بخش {i}): {r.status_code} - {r.text}")
+            else:
+                print(f"📨 بخش {i}/{len(chunks)} ارسال شد.")
+        except Exception as e:
+            print(f"⚠️ ارسال بخش {i} ناموفق: {e}")
+
+
+def send_document(filepath, token, chat_id, caption=""):
+    if not os.path.exists(filepath):
+        print(f"⚠️ فایل {filepath} پیدا نشد.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    try:
+        with open(filepath, "rb") as f:
+            r = requests.post(
+                url,
+                files={"document": f},
+                data={"chat_id": chat_id, "caption": caption},
+                timeout=60,
+            )
+        if r.status_code == 200:
+            print(f"📎 فایل {filepath} ارسال شد.")
+        else:
+            print(f"⚠️ ارسال فایل ناموفق: {r.status_code} - {r.text}")
+    except Exception as e:
+        print(f"⚠️ ارسال فایل ناموفق: {e}")
 
 
 # ============================================================
@@ -212,7 +249,7 @@ groups.sort(key=lambda x: x["count"], reverse=True)
 
 
 # ============================================================
-# خروجی
+# خروجی متنی
 # ============================================================
 lines = []
 lines.append("#" * 56)
@@ -284,3 +321,19 @@ if not summary_df.empty:
 
 print()
 print("✅ خروجی در macd_dtw_result.txt و macd_dtw_summary.csv ذخیره شد.")
+
+
+# ============================================================
+# ارسال به تلگرام
+# ============================================================
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+if TOKEN and CHAT_ID:
+    print()
+    print("📤 ارسال به تلگرام ...")
+    send_to_telegram(output_text, TOKEN, CHAT_ID)
+    if not summary_df.empty:
+        send_document("macd_dtw_summary.csv", TOKEN, CHAT_ID, "📊 خلاصه الگوهای MACD")
+else:
+    print("⚠️ TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده — ارسال انجام نشد.")
