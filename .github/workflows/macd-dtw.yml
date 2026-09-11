@@ -20,15 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade \
-            "yfinance>=0.2.40" \
-            "pandas>=2.0" \
-            "numpy>=1.24" \
-            "dtw-python" \
-            "requests" \
-            "lxml" \
-            "beautifulsoup4" \
-            "pandas-datareader"
+          pip install --upgrade "yfinance>=0.2.40" "pandas>=2.0" "numpy>=1.24" "dtw-python" "requests" "lxml" "beautifulsoup4" "pandas-datareader"
 
       - name: Verify yfinance version
         run: |
@@ -36,12 +28,13 @@ jobs:
 
       - name: Quick data sanity check
         run: |
-          python -c "
-import yfinance as yf
-for t in ['AAPL', 'BTC-USD']:
-    df = yf.download(t, period='1mo', interval='1d', progress=False, threads=False)
-    print(t, '->', 0 if df is None or df.empty else len(df), 'rows')
-"
+          python - <<'EOF'
+          import yfinance as yf
+          for t in ['AAPL', 'BTC-USD']:
+              df = yf.download(t, period='1mo', interval='1d', progress=False, threads=False)
+              n = 0 if df is None or df.empty else len(df)
+              print(t, '->', n, 'rows')
+          EOF
 
       - name: Run MACD DTW
         env:
