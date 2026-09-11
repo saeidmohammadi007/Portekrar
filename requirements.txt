@@ -1,4 +1,5 @@
+numpy
+pandas
 yfinance
 dtw-python
-pandas
-numpy
+requests
