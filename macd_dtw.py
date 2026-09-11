@@ -1,5 +1,6 @@
 # ============================================================
 # پیدا کردن الگوهای پرتکرار MACD با DTW + ارسال به تلگرام
+# (نسخه اصلاح‌شده: امتیازدهی ترکیبی + تنوع نماد)
 # ============================================================
 
 import warnings
@@ -12,6 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
+from collections import defaultdict
 from dtw import dtw
 
 # ============================================================
@@ -33,6 +35,16 @@ TOP_PATTERNS = 10
 MIN_GAP = PATTERN_LENGTH
 L2_PREFILTER = 4.0
 
+# --- پارامترهای امتیازدهی ---
+W_COUNT       = 0.40   # وزن تعداد تکرار (لگاریتمی)
+W_QUALITY     = 0.30   # وزن کیفیت شباهت (DTW پایین = بهتر)
+W_CONSISTENCY = 0.10   # وزن انسجام گروه (std پایین DTW)
+W_DIVERSITY   = 0.10   # وزن تنوع نماد
+W_TIME_SPREAD = 0.10   # وزن پخش زمانی (چند سال)
+
+MAX_PER_TICKER = 3     # حداکثر گروه از هر نماد در لیست نهایی
+SHUFFLE_SEED   = 123   # برای درهم‌ریختن ترتیب الگوها
+
 
 # ============================================================
 # دریافت داده (مقاوم با retry + fallback)
@@ -53,7 +65,6 @@ def get_data(ticker, max_retries=3):
     last_err = None
 
     for attempt in range(1, max_retries + 1):
-        # تلاش ۱: yf.download با period
         try:
             df = yf.download(
                 ticker,
@@ -71,7 +82,6 @@ def get_data(ticker, max_retries=3):
         except Exception as e:
             last_err = e
 
-        # تلاش ۲: fallback با Ticker.history
         try:
             t = yf.Ticker(ticker)
             df = t.history(period="5y", interval="1d", auto_adjust=True)
@@ -82,7 +92,6 @@ def get_data(ticker, max_retries=3):
         except Exception as e:
             last_err = e
 
-        # تلاش ۳: period کوتاه‌تر
         try:
             df = yf.download(
                 ticker, period="2y", interval="1d",
@@ -141,7 +150,6 @@ def dtw_distance(a, b):
     b = normalize(b)
     window_size = max(1, int(SAKOE_CHIBA_RATIO * max(len(a), len(b))))
     try:
-        # نسخه‌های جدید dtw-python
         result = dtw(
             a, b,
             keep_internals=False,
@@ -149,7 +157,6 @@ def dtw_distance(a, b):
             window_args={"window_size": window_size},
         )
     except TypeError:
-        # fallback برای نسخه‌های قدیمی‌تر
         result = dtw(
             a, b,
             keep_internals=False,
@@ -166,6 +173,46 @@ def patterns_overlap(a, b):
             or b["end_idx"] + MIN_GAP <= a["start_idx"]):
         return False
     return True
+
+
+# ============================================================
+# امتیازدهی گروه‌ها
+# ============================================================
+def group_score(g):
+    """امتیاز ترکیبی: count لگاریتمی + کیفیت + انسجام + تنوع + پخش زمانی"""
+    dists = np.array([d for _, d in g["matches"]])
+
+    # ۱) تعداد تکرار (لگاریتمی)
+    count_score = np.log1p(g["count"])
+
+    # ۲) کیفیت شباهت (DTW پایین‌تر = بهتر)
+    if len(dists) > 0:
+        quality = max(0.0, 1.0 - float(dists.mean()) / MAX_DISTANCE)
+    else:
+        quality = 0.0
+
+    # ۳) انسجام (std پایین DTWها)
+    if len(dists) > 1:
+        consistency = 1.0 / (1.0 + float(dists.std()))
+    else:
+        consistency = 1.0
+
+    # ۴) تنوع نماد
+    refs = [all_patterns[g["reference"]]] + [all_patterns[j] for j, _ in g["matches"]]
+    tickers_in = {p["ticker"] for p in refs}
+    diversity = len(tickers_in) / len(TICKERS)
+
+    # ۵) پخش زمانی
+    years_in = {p["start_date"].year for p in refs}
+    time_spread = len(years_in) / 5.0
+
+    return (
+        W_COUNT       * count_score +
+        W_QUALITY     * quality +
+        W_CONSISTENCY * consistency +
+        W_DIVERSITY   * diversity +
+        W_TIME_SPREAD * time_spread
+    )
 
 
 # ============================================================
@@ -270,6 +317,15 @@ if len(all_patterns) < MIN_OCCURRENCES:
 
 
 # ============================================================
+# درهم‌ریختن ترتیب الگوها (تا BTC همیشه اول نباشه)
+# ============================================================
+rng_shuf = np.random.default_rng(SHUFFLE_SEED)
+order = rng_shuf.permutation(len(all_patterns))
+all_patterns = [all_patterns[i] for i in order]
+print(f"🔀 الگوها درهم ریخته شدند (seed={SHUFFLE_SEED})")
+
+
+# ============================================================
 # توزیع فاصله‌ها
 # ============================================================
 print()
@@ -354,18 +410,45 @@ for i in range(len(all_patterns)):
     if (i + 1) % 200 == 0:
         print(f"  پیشرفت: {i+1}/{len(all_patterns)} — گروه: {len(groups)}")
 
-groups.sort(key=lambda x: x["count"], reverse=True)
+# --- مرتب‌سازی بر اساس امتیاز ترکیبی ---
+for g in groups:
+    g["score"] = group_score(g)
+
+groups.sort(key=lambda x: x["score"], reverse=True)
 
 print()
-print("--- کیفیت گروه‌های یافت‌شده ---")
+print("--- کیفیت گروه‌های یافت‌شده (Top 20 بر اساس امتیاز) ---")
 for rank, g in enumerate(groups[:20], 1):
     dists = [d for _, d in g["matches"]]
-    if dists:
-        print(f"  رتبه {rank}: تکرار={g['count']}  میانگین DTW={np.mean(dists):.3f}")
-    else:
-        print(f"  رتبه {rank}: تکرار={g['count']}")
+    ref = all_patterns[g["reference"]]
+    avg_dtw = np.mean(dists) if dists else 0.0
+    print(f"  رتبه {rank}: {ref['ticker']:<10} "
+          f"تکرار={g['count']:<4} میانگین DTW={avg_dtw:.3f}  "
+          f"امتیاز={g['score']:.3f}")
 
-top_groups = groups[:TOP_PATTERNS]
+
+# ============================================================
+# انتخاب TOP_PATTERNS با محدودیت هر نماد
+# ============================================================
+ticker_count = defaultdict(int)
+top_groups = []
+
+for g in groups:
+    ref_ticker = all_patterns[g["reference"]]["ticker"]
+    if ticker_count[ref_ticker] >= MAX_PER_TICKER:
+        continue
+    ticker_count[ref_ticker] += 1
+    top_groups.append(g)
+    if len(top_groups) >= TOP_PATTERNS:
+        break
+
+print()
+print("--- ترکیب نمادها در لیست نهایی ---")
+final_tickers = defaultdict(int)
+for g in top_groups:
+    final_tickers[all_patterns[g["reference"]]["ticker"]] += 1
+for t, c in final_tickers.items():
+    print(f"  {t}: {c} گروه")
 
 
 # ============================================================
@@ -374,6 +457,7 @@ top_groups = groups[:TOP_PATTERNS]
 lines = []
 lines.append("#" * 56)
 lines.append(" پرتکرارترین الگوهای MACD (۱۰ الگوی برتر)")
+lines.append(" (امتیازدهی ترکیبی: تکرار + کیفیت + تنوع + پخش زمانی)")
 lines.append("#" * 56)
 
 if len(top_groups) == 0:
@@ -383,13 +467,26 @@ if len(top_groups) == 0:
 else:
     for rank, group in enumerate(top_groups, 1):
         reference = all_patterns[group["reference"]]
+        dists = [d for _, d in group["matches"]]
+        avg_dtw = float(np.mean(dists)) if dists else 0.0
+        max_dtw = float(max(dists)) if dists else 0.0
+        std_dtw = float(np.std(dists)) if len(dists) > 1 else 0.0
+
+        refs_all = [reference] + [all_patterns[j] for j, _ in group["matches"]]
+        n_tickers = len({p["ticker"] for p in refs_all})
+        n_years = len({p["start_date"].year for p in refs_all})
+
         lines.append("")
         lines.append("=" * 56)
-        lines.append(f"رتبه الگو: {rank}")
+        lines.append(f"رتبه الگو: {rank}   |   امتیاز: {group['score']:.3f}")
         lines.append(f"تعداد تکرار مستقل: {group['count']}")
         lines.append(f"نماد مرجع: {reference['ticker']}")
         lines.append(f"شروع: {reference['start_date'].strftime('%Y-%m-%d')}")
         lines.append(f"پایان: {reference['end_date'].strftime('%Y-%m-%d')}")
+        lines.append(f"میانگین DTW: {avg_dtw:.3f}   |   "
+                     f"Max DTW: {max_dtw:.3f}   |   Std DTW: {std_dtw:.3f}")
+        lines.append(f"تنوع نماد: {n_tickers}/{len(TICKERS)}   |   "
+                     f"پخش زمانی: {n_years} سال")
         lines.append("")
         lines.append("نمونه‌های مشابه:")
         lines.append("-" * 70)
@@ -414,14 +511,19 @@ summary = []
 for rank, group in enumerate(top_groups, 1):
     reference = all_patterns[group["reference"]]
     dists = [d for _, d in group["matches"]]
+    refs_all = [reference] + [all_patterns[j] for j, _ in group["matches"]]
     summary.append({
         "Rank": rank,
+        "Score": round(float(group["score"]), 4),
         "Symbol": reference["ticker"],
         "Pattern Start": reference["start_date"].strftime("%Y-%m-%d"),
         "Pattern End": reference["end_date"].strftime("%Y-%m-%d"),
         "Occurrences": group["count"],
         "Avg DTW": round(float(np.mean(dists)), 4) if dists else 0.0,
         "Max DTW": round(float(max(dists)), 4) if dists else 0.0,
+        "Std DTW": round(float(np.std(dists)), 4) if len(dists) > 1 else 0.0,
+        "Diversity": f"{len({p['ticker'] for p in refs_all})}/{len(TICKERS)}",
+        "Years": len({p["start_date"].year for p in refs_all}),
     })
 
 summary_df = pd.DataFrame(summary)
@@ -461,7 +563,7 @@ if TOKEN and CHAT_ID:
             "macd_dtw_summary.csv",
             TOKEN,
             CHAT_ID,
-            "📊 خلاصه ۱۰ الگوی پرتکرار MACD"
+            "📊 خلاصه ۱۰ الگوی پرتکرار MACD (امتیازدهی ترکیبی)"
         )
 else:
     print("⚠️ TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده.")
