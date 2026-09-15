@@ -9,7 +9,7 @@ import ccxt
 
 # --- الگوی مرجع: تک‌کندل روزانه BTC ---
 PATTERN_SYMBOL = 'BTC-USD'
-PATTERN_DATE   = '2024-01-23'
+PATTERN_DATE   = '2024-02-05'
 SHOW_N         = 10
 
 # ---------- توابع ----------
