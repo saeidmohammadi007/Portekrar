@@ -1,569 +1,186 @@
-# ============================================================
-# پیدا کردن الگوهای پرتکرار MACD با DTW + ارسال به تلگرام
-# (نسخه اصلاح‌شده: امتیازدهی ترکیبی + تنوع نماد)
-# ============================================================
-
-import warnings
-warnings.filterwarnings("ignore")
-
 import os
-import time
-import html
-import numpy as np
 import pandas as pd
+import numpy as np
 import yfinance as yf
+from tqdm import tqdm
+import time
 import requests
-from collections import defaultdict
-from dtw import dtw
+import ccxt
 
-# ============================================================
-# تنظیمات
-# ============================================================
-TICKERS = [
-    "BTC-USD", "BNB-USD", "XTZ-USD", "AVAX-USD", "DOGE-USD"
-]
+# --- الگوی مرجع: تک‌کندل روزانه BTC ---
+PATTERN_SYMBOL = 'BTC-USD'
+PATTERN_DATE   = '2024-01-23'
+SHOW_N         = 10
 
-PATTERN_LENGTH = 60
-FAST = 12
-SLOW = 26
-SIGNAL = 9
+# ---------- توابع ----------
+def get_lbank_futures_symbols():
+    exchange = ccxt.lbank({'options': {'defaultType': 'future'}})
+    try:
+        markets = exchange.load_markets()
+    except Exception as e:
+        print(f"❌ خطا در اتصال به LBank: {e}")
+        return []
 
-MAX_DISTANCE = 2.0
-SAKOE_CHIBA_RATIO = 0.5
-MIN_OCCURRENCES = 3
-TOP_PATTERNS = 10
-MIN_GAP = PATTERN_LENGTH
-L2_PREFILTER = 4.0
+    base_list = []
+    for symbol, market in markets.items():
+        if not market.get('swap'):
+            continue
+        base = market.get('base')
+        if not base or base.isdigit():
+            continue
+        base_list.append(base.upper())
 
-# --- پارامترهای امتیازدهی ---
-W_COUNT       = 0.40   # وزن تعداد تکرار (لگاریتمی)
-W_QUALITY     = 0.30   # وزن کیفیت شباهت (DTW پایین = بهتر)
-W_CONSISTENCY = 0.10   # وزن انسجام گروه (std پایین DTW)
-W_DIVERSITY   = 0.10   # وزن تنوع نماد
-W_TIME_SPREAD = 0.10   # وزن پخش زمانی (چند سال)
+    seen, unique_bases = set(), []
+    for b in base_list:
+        if b not in seen:
+            seen.add(b)
+            unique_bases.append(b)
+    print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
+    return unique_bases
 
-MAX_PER_TICKER = 3     # حداکثر گروه از هر نماد در لیست نهایی
-SHUFFLE_SEED   = 123   # برای درهم‌ریختن ترتیب الگوها
-
-
-# ============================================================
-# دریافت داده (مقاوم با retry + fallback)
-# ============================================================
-def _clean_df(df):
-    if df is None or df.empty:
+def get_daily_data(ticker, start='2024-01-01'):
+    """داده‌ی روزانه فقط برای استخراج کندل الگو"""
+    df = yf.download(ticker, start=start, interval='1d',
+                     progress=False, auto_adjust=False)
+    if df.empty:
         return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if "Close" not in df.columns:
-        return None
-    df = df[["Close"]].dropna()
+    df = df[['Open', 'High', 'Low', 'Close']].copy()
+    df.index = pd.to_datetime(df.index)
+    df.columns = ['open', 'high', 'low', 'close']
     return df
 
+def get_4h_data(ticker):
+    """
+    دریافت داده‌ی ۱ ساعته و تبدیل به ۴ ساعته.
+    yfinance بازه‌ی 4h را مستقیم پشتیبانی نمی‌کند.
+    """
+    df = yf.download(ticker, period='60d', interval='1h',
+                     progress=False, auto_adjust=False)
+    if df.empty:
+        return None
+    df = df[['Open', 'High', 'Low', 'Close']].copy()
+    df.index = pd.to_datetime(df.index)
+    df.columns = ['open', 'high', 'low', 'close']
 
-def get_data(ticker, max_retries=3):
-    print(f"دریافت {ticker} ...")
-    last_err = None
+    # حذف تایم‌زون برای سازگاری با resample
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            df = yf.download(
-                ticker,
-                period="5y",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-                timeout=30,
-            )
-            df = _clean_df(df)
-            if df is not None and len(df) >= PATTERN_LENGTH:
-                print(f"  ✅ {ticker}: {len(df)} رکورد.")
-                return df
-        except Exception as e:
-            last_err = e
-
-        try:
-            t = yf.Ticker(ticker)
-            df = t.history(period="5y", interval="1d", auto_adjust=True)
-            df = _clean_df(df)
-            if df is not None and len(df) >= PATTERN_LENGTH:
-                print(f"  ✅ {ticker} (history): {len(df)} رکورد.")
-                return df
-        except Exception as e:
-            last_err = e
-
-        try:
-            df = yf.download(
-                ticker, period="2y", interval="1d",
-                auto_adjust=True, progress=False,
-                threads=False, timeout=30,
-            )
-            df = _clean_df(df)
-            if df is not None and len(df) >= PATTERN_LENGTH:
-                print(f"  ✅ {ticker} (2y): {len(df)} رکورد.")
-                return df
-        except Exception as e:
-            last_err = e
-
-        print(f"  ⚠️ تلاش {attempt} ناموفق برای {ticker}")
-        time.sleep(2 * attempt)
-
-    print(f"❌ {ticker}: داده پیدا نشد. آخرین خطا: {last_err}")
-    return None
-
-
-# ============================================================
-# محاسبات
-# ============================================================
-def calculate_macd(df):
-    close = df["Close"].astype(float)
-    ema_fast = close.ewm(span=FAST, adjust=False).mean()
-    ema_slow = close.ewm(span=SLOW, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal = macd.ewm(span=SIGNAL, adjust=False).mean()
-    histogram = macd - signal
-    return pd.DataFrame({
-        "MACD": macd, "Signal": signal, "Histogram": histogram
+    df_4h = df.resample('4h').agg({
+        'open':   'first',
+        'high':   'max',
+        'low':    'min',
+        'close':  'last',
     }).dropna()
+    return df_4h
 
+def candle_vector(o, h, l, c):
+    """بردار ۴بعدی نرمال‌شده‌ی کندل نسبت به دامنه High−Low"""
+    rng = float(h - l)
+    if rng <= 0 or not np.isfinite(rng):
+        return None
+    return np.array([
+        (float(o) - float(l)) / rng,
+        1.0,
+        0.0,
+        (float(c) - float(l)) / rng,
+    ])
 
-def normalize(x):
-    x = np.asarray(x, dtype=float)
-    mean = np.mean(x)
-    std = np.std(x)
-    if std < 1e-10:
-        return x - mean
-    return (x - mean) / std
-
-
-def l2_norm_dist(a, b):
-    a = normalize(a)
-    b = normalize(b)
-    if len(a) != len(b):
-        n = min(len(a), len(b))
-        a, b = a[:n], b[:n]
-    return float(np.linalg.norm(a - b) / len(a))
-
-
-def dtw_distance(a, b):
-    a = normalize(a)
-    b = normalize(b)
-    window_size = max(1, int(SAKOE_CHIBA_RATIO * max(len(a), len(b))))
-    try:
-        result = dtw(
-            a, b,
-            keep_internals=False,
-            window_type="sakoechiba",
-            window_args={"window_size": window_size},
-        )
-    except TypeError:
-        result = dtw(
-            a, b,
-            keep_internals=False,
-            window_type="sakoechiba",
-            window_size=window_size,
-        )
-    return result.distance / len(a)
-
-
-def patterns_overlap(a, b):
-    if a["ticker"] != b["ticker"]:
-        return False
-    if (a["end_idx"] + MIN_GAP <= b["start_idx"]
-            or b["end_idx"] + MIN_GAP <= a["start_idx"]):
-        return False
-    return True
-
-
-# ============================================================
-# امتیازدهی گروه‌ها
-# ============================================================
-def group_score(g):
-    """امتیاز ترکیبی: count لگاریتمی + کیفیت + انسجام + تنوع + پخش زمانی"""
-    dists = np.array([d for _, d in g["matches"]])
-
-    # ۱) تعداد تکرار (لگاریتمی)
-    count_score = np.log1p(g["count"])
-
-    # ۲) کیفیت شباهت (DTW پایین‌تر = بهتر)
-    if len(dists) > 0:
-        quality = max(0.0, 1.0 - float(dists.mean()) / MAX_DISTANCE)
-    else:
-        quality = 0.0
-
-    # ۳) انسجام (std پایین DTWها)
-    if len(dists) > 1:
-        consistency = 1.0 / (1.0 + float(dists.std()))
-    else:
-        consistency = 1.0
-
-    # ۴) تنوع نماد
-    refs = [all_patterns[g["reference"]]] + [all_patterns[j] for j, _ in g["matches"]]
-    tickers_in = {p["ticker"] for p in refs}
-    diversity = len(tickers_in) / len(TICKERS)
-
-    # ۵) پخش زمانی
-    years_in = {p["start_date"].year for p in refs}
-    time_spread = len(years_in) / 5.0
-
-    return (
-        W_COUNT       * count_score +
-        W_QUALITY     * quality +
-        W_CONSISTENCY * consistency +
-        W_DIVERSITY   * diversity +
-        W_TIME_SPREAD * time_spread
-    )
-
-
-# ============================================================
-# تلگرام
-# ============================================================
-def send_to_telegram(text, token, chat_id):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    MAX_LEN = 4000
-    safe_text = html.escape(text)
-    chunks = [safe_text[i:i + MAX_LEN] for i in range(0, len(safe_text), MAX_LEN)]
-    for i, chunk in enumerate(chunks, 1):
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        try:
-            r = requests.post(url, data=payload, timeout=30)
-            if r.status_code != 200:
-                print(f"⚠️ تلگرام خطا (بخش {i}): {r.status_code} - {r.text}")
-            else:
-                print(f"📨 بخش {i}/{len(chunks)} ارسال شد.")
-        except Exception as e:
-            print(f"⚠️ ارسال بخش {i} ناموفق: {e}")
-
-
-def send_document(filepath, token, chat_id, caption=""):
-    if not os.path.exists(filepath):
-        print(f"⚠️ فایل {filepath} پیدا نشد.")
+def send_telegram_message(text):
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        print("❌ توکن یا chat_id تنظیم نشده است.")
         return
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
     try:
-        with open(filepath, "rb") as f:
-            r = requests.post(
-                url,
-                files={"document": f},
-                data={"chat_id": chat_id, "caption": caption},
-                timeout=60,
-            )
-        if r.status_code == 200:
-            print(f"📎 فایل {filepath} ارسال شد.")
+        r = requests.post(url, data=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ خطا در ارسال پیام: {r.text}")
         else:
-            print(f"⚠️ ارسال فایل ناموفق: {r.status_code} - {r.text}")
+            print("✅ پیام با موفقیت به تلگرام ارسال شد.")
     except Exception as e:
-        print(f"⚠️ ارسال فایل ناموفق: {e}")
+        print(f"❌ خطا در ارسال به تلگرام: {e}")
 
+# ---------- اجرای اصلی ----------
+print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} (روزانه) ...")
+ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')
+if ref_daily is None:
+    print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
+    exit()
 
-# ============================================================
-# ساخت الگوها
-# ============================================================
-all_patterns = []
+target_date = pd.to_datetime(PATTERN_DATE).date()
+mask = ref_daily.index.date == target_date
+if not mask.any():
+    print(f"❌ کندلی برای تاریخ {PATTERN_DATE} یافت نشد.")
+    exit()
 
-for ticker in TICKERS:
-    df = get_data(ticker)
-    if df is None:
-        continue
+candle = ref_daily[mask].iloc[0]
+o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+pattern_vec = candle_vector(o, h, l, c)
+if pattern_vec is None:
+    print("❌ کندل مرجع نامعتبر است.")
+    exit()
 
-    macd_df = calculate_macd(df)
+print(f"📌 کندل مرجع (روزانه): O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
+print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
+      f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
 
-    if len(macd_df) < PATTERN_LENGTH:
-        print(f"⚠️ {ticker}: داده کافی ندارد ({len(macd_df)} < {PATTERN_LENGTH}).")
-        continue
+print("\n📊 دریافت نمادهای فیوچرز LBank ...")
+symbols = get_lbank_futures_symbols()
+if not symbols:
+    print("❌ هیچ نمادی برای اسکن وجود ندارد!")
+    exit()
 
-    macd_values = macd_df["MACD"].values
-    dates = macd_df.index
+results = []
+for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
+    try:
+        df_4h = get_4h_data(f"{sym}-USD")
+        if df_4h is None or len(df_4h) < 3:   # ✅ حداقل ۳ کندل لازم است
+            continue
 
-    step = max(1, PATTERN_LENGTH // 4)
+        prev = df_4h.iloc[-2]                  # ✅ کندل یکی قبل از آخرین
+        vec = candle_vector(prev['open'], prev['high'],
+                            prev['low'],  prev['close'])
+        if vec is None:
+            continue
 
-    for end_idx in range(PATTERN_LENGTH, len(macd_values) + 1, step):
-        start_idx = end_idx - PATTERN_LENGTH
-        pattern = macd_values[start_idx:end_idx]
-        all_patterns.append({
-            "ticker": ticker,
-            "start_idx": start_idx,
-            "end_idx": end_idx - 1,
-            "start_date": dates[start_idx],
-            "end_date": dates[end_idx - 1],
-            "pattern": pattern
+        dist = float(np.linalg.norm(pattern_vec - vec))
+
+        results.append({
+            'symbol':   sym,
+            'dist':     dist,
+            'last_4h':  df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),  # ✅ زمان کندل قبلی
+            'o': float(prev['open']),
+            'h': float(prev['high']),
+            'l': float(prev['low']),
+            'c': float(prev['close']),
         })
-
-print()
-print("================================================")
-print("تعداد کل الگوهای MACD")
-print("================================================")
-print(len(all_patterns))
-print(f"طول هر الگو: {PATTERN_LENGTH} کندل روزانه")
-print(f"DTW با Sakoe-Chiba Band = {SAKOE_CHIBA_RATIO}")
-
-if len(all_patterns) < MIN_OCCURRENCES:
-    msg = (
-        f"❌ فقط {len(all_patterns)} الگو ساخته شد؛ "
-        f"حداقل {MIN_OCCURRENCES} لازم است.\n"
-        "یعنی دریافت داده از yfinance ناموفق بود."
-    )
-    print(msg)
-    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-    if TOKEN and CHAT_ID:
-        send_to_telegram(msg, TOKEN, CHAT_ID)
-    raise SystemExit
-
-
-# ============================================================
-# درهم‌ریختن ترتیب الگوها (تا BTC همیشه اول نباشه)
-# ============================================================
-rng_shuf = np.random.default_rng(SHUFFLE_SEED)
-order = rng_shuf.permutation(len(all_patterns))
-all_patterns = [all_patterns[i] for i in order]
-print(f"🔀 الگوها درهم ریخته شدند (seed={SHUFFLE_SEED})")
-
-
-# ============================================================
-# توزیع فاصله‌ها
-# ============================================================
-print()
-print("نمونه‌گیری از توزیع فاصله‌های DTW ...")
-rng = np.random.default_rng(42)
-sample_dists = []
-n = len(all_patterns)
-tries = 0
-while len(sample_dists) < 1000 and tries < 20000:
-    tries += 1
-    i, j = rng.integers(0, n, 2)
-    if i == j:
-        continue
-    a, b = all_patterns[i], all_patterns[j]
-    if patterns_overlap(a, b):
-        continue
-    if l2_norm_dist(a["pattern"], b["pattern"]) > L2_PREFILTER:
-        continue
-    sample_dists.append(dtw_distance(a["pattern"], b["pattern"]))
-
-if sample_dists:
-    sd = np.array(sample_dists)
-    print(f"  تعداد نمونه: {len(sd)}")
-    print(f"  min={sd.min():.3f}  p50={np.percentile(sd,50):.3f}  max={sd.max():.3f}")
-    print(f"  ➜ MAX_DISTANCE فعلی: {MAX_DISTANCE}")
-
-
-# ============================================================
-# جستجوی گروه‌ها
-# ============================================================
-print()
-print("جستجوی الگوهای مشابه با DTW ...")
-
-groups = []
-used_patterns = set()
-
-for i in range(len(all_patterns)):
-    if i in used_patterns:
+        time.sleep(0.3)
+    except Exception:
         continue
 
-    reference = all_patterns[i]
-    candidates = []
+if results:
+    df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
-    for j in range(i + 1, len(all_patterns)):
-        if j in used_patterns:
-            continue
-
-        candidate = all_patterns[j]
-        if patterns_overlap(reference, candidate):
-            continue
-
-        if l2_norm_dist(reference["pattern"], candidate["pattern"]) > L2_PREFILTER:
-            continue
-
-        distance = dtw_distance(reference["pattern"], candidate["pattern"])
-        if distance <= MAX_DISTANCE:
-            candidates.append((j, distance))
-
-    candidates.sort(key=lambda x: x[1])
-
-    selected = []
-    for j, distance in candidates:
-        candidate = all_patterns[j]
-        overlap = False
-        for selected_j, _ in selected:
-            if patterns_overlap(candidate, all_patterns[selected_j]):
-                overlap = True
-                break
-        if not overlap:
-            selected.append((j, distance))
-
-    occurrences = 1 + len(selected)
-
-    if occurrences >= MIN_OCCURRENCES:
-        groups.append({
-            "reference": i,
-            "matches": selected,
-            "count": occurrences
-        })
-        used_patterns.add(i)
-
-    if (i + 1) % 200 == 0:
-        print(f"  پیشرفت: {i+1}/{len(all_patterns)} — گروه: {len(groups)}")
-
-# --- مرتب‌سازی بر اساس امتیاز ترکیبی ---
-for g in groups:
-    g["score"] = group_score(g)
-
-groups.sort(key=lambda x: x["score"], reverse=True)
-
-print()
-print("--- کیفیت گروه‌های یافت‌شده (Top 20 بر اساس امتیاز) ---")
-for rank, g in enumerate(groups[:20], 1):
-    dists = [d for _, d in g["matches"]]
-    ref = all_patterns[g["reference"]]
-    avg_dtw = np.mean(dists) if dists else 0.0
-    print(f"  رتبه {rank}: {ref['ticker']:<10} "
-          f"تکرار={g['count']:<4} میانگین DTW={avg_dtw:.3f}  "
-          f"امتیاز={g['score']:.3f}")
-
-
-# ============================================================
-# انتخاب TOP_PATTERNS با محدودیت هر نماد
-# ============================================================
-ticker_count = defaultdict(int)
-top_groups = []
-
-for g in groups:
-    ref_ticker = all_patterns[g["reference"]]["ticker"]
-    if ticker_count[ref_ticker] >= MAX_PER_TICKER:
-        continue
-    ticker_count[ref_ticker] += 1
-    top_groups.append(g)
-    if len(top_groups) >= TOP_PATTERNS:
-        break
-
-print()
-print("--- ترکیب نمادها در لیست نهایی ---")
-final_tickers = defaultdict(int)
-for g in top_groups:
-    final_tickers[all_patterns[g["reference"]]["ticker"]] += 1
-for t, c in final_tickers.items():
-    print(f"  {t}: {c} گروه")
-
-
-# ============================================================
-# خروجی متنی
-# ============================================================
-lines = []
-lines.append("#" * 56)
-lines.append(" پرتکرارترین الگوهای MACD (۱۰ الگوی برتر)")
-lines.append(" (امتیازدهی ترکیبی: تکرار + کیفیت + تنوع + پخش زمانی)")
-lines.append("#" * 56)
-
-if len(top_groups) == 0:
-    lines.append("")
-    lines.append("هیچ الگوی پرتکراری با تنظیمات فعلی پیدا نشد.")
-    lines.append("برای پیدا کردن نمونه‌های بیشتر، MAX_DISTANCE را افزایش بده.")
-else:
-    for rank, group in enumerate(top_groups, 1):
-        reference = all_patterns[group["reference"]]
-        dists = [d for _, d in group["matches"]]
-        avg_dtw = float(np.mean(dists)) if dists else 0.0
-        max_dtw = float(max(dists)) if dists else 0.0
-        std_dtw = float(np.std(dists)) if len(dists) > 1 else 0.0
-
-        refs_all = [reference] + [all_patterns[j] for j, _ in group["matches"]]
-        n_tickers = len({p["ticker"] for p in refs_all})
-        n_years = len({p["start_date"].year for p in refs_all})
-
-        lines.append("")
-        lines.append("=" * 56)
-        lines.append(f"رتبه الگو: {rank}   |   امتیاز: {group['score']:.3f}")
-        lines.append(f"تعداد تکرار مستقل: {group['count']}")
-        lines.append(f"نماد مرجع: {reference['ticker']}")
-        lines.append(f"شروع: {reference['start_date'].strftime('%Y-%m-%d')}")
-        lines.append(f"پایان: {reference['end_date'].strftime('%Y-%m-%d')}")
-        lines.append(f"میانگین DTW: {avg_dtw:.3f}   |   "
-                     f"Max DTW: {max_dtw:.3f}   |   Std DTW: {std_dtw:.3f}")
-        lines.append(f"تنوع نماد: {n_tickers}/{len(TICKERS)}   |   "
-                     f"پخش زمانی: {n_years} سال")
-        lines.append("")
-        lines.append("نمونه‌های مشابه:")
-        lines.append("-" * 70)
-        lines.append(f"{'نماد':<12}{'شروع':<15}{'پایان':<15}{'DTW':<12}")
-        lines.append("-" * 70)
+    lines = []
+    lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
+    lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}\n")
+    for _, row in df_res.iterrows():
         lines.append(
-            f"{reference['ticker']:<12}"
-            f"{reference['start_date'].strftime('%Y-%m-%d'):<15}"
-            f"{reference['end_date'].strftime('%Y-%m-%d'):<15}"
-            f"{0:<12.4f}"
+            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
+            f"   زمان ۴h: {row['last_4h']} | "
+            f"O={row['o']:.6g} H={row['h']:.6g} "
+            f"L={row['l']:.6g} C={row['c']:.6g}"
         )
-        for j, distance in group["matches"]:
-            sample = all_patterns[j]
-            lines.append(
-                f"{sample['ticker']:<12}"
-                f"{sample['start_date'].strftime('%Y-%m-%d'):<15}"
-                f"{sample['end_date'].strftime('%Y-%m-%d'):<15}"
-                f"{distance:<12.4f}"
-            )
+    lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
+    message = "\n".join(lines)
 
-summary = []
-for rank, group in enumerate(top_groups, 1):
-    reference = all_patterns[group["reference"]]
-    dists = [d for _, d in group["matches"]]
-    refs_all = [reference] + [all_patterns[j] for j, _ in group["matches"]]
-    summary.append({
-        "Rank": rank,
-        "Score": round(float(group["score"]), 4),
-        "Symbol": reference["ticker"],
-        "Pattern Start": reference["start_date"].strftime("%Y-%m-%d"),
-        "Pattern End": reference["end_date"].strftime("%Y-%m-%d"),
-        "Occurrences": group["count"],
-        "Avg DTW": round(float(np.mean(dists)), 4) if dists else 0.0,
-        "Max DTW": round(float(max(dists)), 4) if dists else 0.0,
-        "Std DTW": round(float(np.std(dists)), 4) if len(dists) > 1 else 0.0,
-        "Diversity": f"{len({p['ticker'] for p in refs_all})}/{len(TICKERS)}",
-        "Years": len({p["start_date"].year for p in refs_all}),
-    })
-
-summary_df = pd.DataFrame(summary)
-
-lines.append("")
-lines.append("=" * 56)
-lines.append("خلاصه (۱۰ الگوی برتر)")
-lines.append("=" * 56)
-lines.append(summary_df.to_string(index=False) if not summary_df.empty else "خالی")
-
-output_text = "\n".join(lines)
-print()
-print(output_text)
-
-with open("macd_dtw_result.txt", "w", encoding="utf-8") as f:
-    f.write(output_text)
-
-if not summary_df.empty:
-    summary_df.to_csv("macd_dtw_summary.csv", index=False)
-
-print()
-print("✅ خروجی ذخیره شد.")
-
-
-# ============================================================
-# ارسال به تلگرام
-# ============================================================
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-if TOKEN and CHAT_ID:
-    print()
-    print("📤 ارسال به تلگرام ...")
-    send_to_telegram(output_text, TOKEN, CHAT_ID)
-    if not summary_df.empty:
-        send_document(
-            "macd_dtw_summary.csv",
-            TOKEN,
-            CHAT_ID,
-            "📊 خلاصه ۱۰ الگوی پرتکرار MACD (امتیازدهی ترکیبی)"
-        )
+    send_telegram_message(message)
+    print("\n" + message)
 else:
-    print("⚠️ TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده.")
+    print("\n❌ نتیجه‌ای یافت نشد.")
+    send_telegram_message("❌ در اسکن امروز هیچ نتیجه‌ای یافت نشد.")
+
+print("\n✅ اسکن کامل شد!")
