@@ -1,54 +1,27 @@
-name: MACD DTW Pattern Finder
+name: LBank Pattern Scanner
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # اجرای دستی از تب Actions
 
 jobs:
-  run-macd-dtw:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install --upgrade "yfinance>=0.2.40" "pandas>=2.0" "numpy>=1.24" "dtw-python" "requests" "lxml" "beautifulsoup4" "pandas-datareader"
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Verify yfinance version
-        run: |
-          python -c "import yfinance, pandas; print('yfinance:', yfinance.__version__); print('pandas:', pandas.__version__)"
-
-      - name: Quick data sanity check
-        run: |
-          python - <<'EOF'
-          import yfinance as yf
-          for t in ['AAPL', 'BTC-USD']:
-              df = yf.download(t, period='1mo', interval='1d', progress=False, threads=False)
-              n = 0 if df is None or df.empty else len(df)
-              print(t, '->', n, 'rows')
-          EOF
-
-      - name: Run MACD DTW
+      - name: Run scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python macd_dtw.py
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: macd-dtw-output
-          path: |
-            macd_dtw_result.txt
-            macd_dtw_summary.csv
-          retention-days: 30
-          if-no-files-found: warn
+        run: python saeid.py
