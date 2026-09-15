@@ -1,5 +1,7 @@
+yfinance
+pycoingecko
+tqdm
+requests
+ccxt
 numpy
 pandas
-yfinance
-dtw-python
-requests
